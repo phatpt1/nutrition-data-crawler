@@ -196,3 +196,20 @@ if st.button("🚀 Bắt đầu Cào & Lọc Dữ Liệu", type="primary"):
             
         st.balloons()
         st.success(f"🎉 HOÀN THÀNH! Đã thêm thành công {added_count} bài viết đạt chuẩn vào file JSON.")
+        # ==============================================================================
+# 📥 NÚT TẢI FILE JSON TRỰC TIẾP VỀ MÁY CÁ NHÂN
+# ==============================================================================
+if os.path.exists(OUTPUT_CLEAN_JSON):
+    st.divider()
+    st.subheader("📥 Tải Dữ Liệu Đã Cào")
+    
+    with open(OUTPUT_CLEAN_JSON, "r", encoding="utf-8") as f:
+        json_data = f.read()
+        
+    st.download_button(
+        label="💾 Bấm vào đây để tải file dataset_dinh_duong_CUSTOM.json về máy",
+        data=json_data,
+        file_name="dataset_dinh_duong_CUSTOM.json",
+        mime="application/json",
+        type="primary"
+    )
