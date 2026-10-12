@@ -1,215 +1,299 @@
+"""Universal Knowledge Crawler — local-first Streamlit application."""
+import hashlib
+import io
+import ipaddress
 import json
-import os
 import re
+import socket
+import sqlite3
 import time
+import zipfile
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import urljoin, urlsplit, urlunsplit
+from urllib.robotparser import RobotFileParser
+
+import pandas as pd
 import requests
-from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse
 import streamlit as st
+from bs4 import BeautifulSoup
+import trafilatura
+import fitz
 
-st.set_page_config(page_title="Data Crawler Dinh Dưỡng Nâng Cao", page_icon="🥗", layout="wide")
-st.title("🥗 Công Cụ Cào Sâu & Lọc Kỹ Dữ Liệu Dinh Dưỡng / Calo")
+ROOT = Path(__file__).resolve().parent
+DATA = ROOT / 'data'
+DATA.mkdir(exist_ok=True)
+DB = DATA / 'crawler.sqlite3'
+USER_AGENT = 'UniversalKnowledgeCrawler/1.0 (respectful research crawler)'
+HEADERS = {'User-Agent': USER_AGENT, 'Accept': 'text/html,application/pdf;q=0.9,*/*;q=0.5'}
+MAX_BYTES = 12 * 1024 * 1024
 
-DOWNLOADS_DIR = os.path.dirname(os.path.abspath(__file__))
-OUTPUT_CLEAN_JSON = os.path.join(DOWNLOADS_DIR, "dataset_dinh_duong_CUSTOM.json")
 
-# Danh sách từ khóa bắt buộc
-MUST_HAVE_KEYWORDS = [
-    "dinh dưỡng", "calo", "calorie", "protein", "carb", "chất béo", "chất xơ",
-    "thực đơn", "ăn uống", "tăng cân", "giảm cân", "béo phì", "tiểu đường",
-    "mỡ máu", "gout", "axit uric", "tim mạch", "huyết áp", "gan nhiễm mỡ",
-    "vitamin", "khoáng chất", "ăn kiêng", "keto", "intermittent fasting", "nhịn ăn", 
-    "thực phẩm", "món ăn", "suy nhược", "bồi bổ", "món ăn bài thuốc", "chế độ ăn"
-]
+def db():
+    con = sqlite3.connect(DB)
+    con.row_factory = sqlite3.Row
+    con.execute('CREATE TABLE IF NOT EXISTS topics (id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, config TEXT NOT NULL)')
+    con.execute('''CREATE TABLE IF NOT EXISTS documents (
+        id INTEGER PRIMARY KEY, url TEXT UNIQUE NOT NULL, title TEXT, content TEXT,
+        sha256 TEXT, content_type TEXT, fetched_at TEXT)''')
+    con.execute('''CREATE TABLE IF NOT EXISTS memberships (
+        topic_id INTEGER, document_id INTEGER, accepted INTEGER DEFAULT 0,
+        PRIMARY KEY(topic_id, document_id))''')
+    con.commit()
+    return con
 
-# Danh sách từ khóa loại trừ bài rác
-EXCLUDE_KEYWORDS = [
-    "bản quyền", "đặt lịch khám", "tuyển dụng", "bằng khen",
-    "liên hệ", "sơ đồ trang", "lịch công tác", "đăng nhập", "chính sách bảo mật"
-]
 
-def fix_url_format(url):
-    """Đảm bảo URL luôn có https://"""
+def normalize_url(url):
     url = url.strip()
-    if not url.startswith("http://") and not url.startswith("https://"):
-        url = "https://" + url
-    return url
+    if not url: raise ValueError('URL trống')
+    if not url.startswith(('https://', 'http://')): url = 'https://' + url
+    p = urlsplit(url)
+    if p.scheme not in ('http', 'https') or not p.hostname or p.username or p.password:
+        raise ValueError('URL không hợp lệ')
+    if p.port and p.port not in (80, 443): raise ValueError('Chỉ cho phép cổng HTTP/HTTPS tiêu chuẩn')
+    return urlunsplit((p.scheme, p.netloc.lower(), p.path or '/', p.query, ''))
 
-def clean_text(text):
-    text = re.sub(r'\s+', ' ', text)
-    return text.strip()
 
-def is_nutrition_topic(title, content):
-    full_text = (title + " " + content).lower()
-    for exc in EXCLUDE_KEYWORDS:
-        if exc in title.lower():
-            return False, f"Chứa từ khóa loại trừ: '{exc}'"
-            
-    score = sum(1 for kw in MUST_HAVE_KEYWORDS if kw in full_text)
-    if score >= 1:
-        return True, f"Đạt chuẩn (Khớp {score} từ khóa chuyên ngành)"
-    return False, f"Không chứa từ khóa dinh dưỡng/sức khỏe (Score = {score})"
-
-def get_sub_links(base_url, max_links=30):
-    """Quét trang gốc để lấy danh sách các URL bài viết con"""
-    base_url = fix_url_format(base_url)
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    sub_links = set()
+def is_public_host(url):
+    host = urlsplit(url).hostname
+    if not host or host.lower() in ('localhost',) or host.lower().endswith(('.local', '.internal', '.localhost')):
+        return False
     try:
-        res = requests.get(base_url, headers=headers, timeout=10)
-        res.encoding = 'utf-8'
-        soup = BeautifulSoup(res.text, 'html.parser')
-        
-        domain = urlparse(base_url).netloc
-        
-        for a in soup.find_all('a', href=True):
-            href = a['href'].strip()
-            full_url = urljoin(base_url, href)
-            parsed_url = urlparse(full_url)
-            
-            # Chỉ lấy các link cùng domain và không chứa file tĩnh/anchor
-            if parsed_url.netloc == domain and not any(full_url.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.pdf', '.docx', '#']):
-                if not any(x in full_url.lower() for x in ['login', 'register', 'contact', 'lien-he', 'cart', 'search']):
-                    sub_links.add(full_url)
-                    if len(sub_links) >= max_links:
-                        break
-    except Exception as e:
-        st.error(f"Lỗi khi tìm link con từ {base_url}: {e}")
-        
-    return list(sub_links)
+        answers = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+        return bool(answers) and all(ipaddress.ip_address(item[4][0]).is_global for item in answers)
+    except (OSError, ValueError):
+        return False
 
-def scrape_single_article(url):
-    url = fix_url_format(url)
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
-    try:
-        res = requests.get(url, headers=headers, timeout=12)
-        res.encoding = 'utf-8'
-        soup = BeautifulSoup(res.text, 'html.parser')
-        
-        for tag in soup(['script', 'style', 'nav', 'header', 'footer', 'aside', 'iframe', 'noscript']):
-            tag.decompose()
-            
-        title = ""
-        if soup.find('h1'):
-            title = soup.find('h1').get_text()
-        elif soup.title:
-            title = soup.title.get_text()
-        title = clean_text(title)
-        
-        paragraphs = []
-        main_content = (
-            soup.find('article') 
-            or soup.find('div', class_=re.compile(r'entry-content|post-content|td-post-content|content-detail|vc_column-inner', re.I))
-            or soup.find('main') 
-            or soup
-        )
-        
-        for el in main_content.find_all(['p', 'li', 'h2', 'h3']):
-            text = clean_text(el.get_text())
-            if len(text) > 25 and not any(kw in text.lower() for kw in EXCLUDE_KEYWORDS):
-                paragraphs.append(text)
-                
-        content = "\n".join(paragraphs)
-        
-        if len(content) < 150:
-            return None, f"Nội dung cào được quá ngắn ({len(content)} ký tự)"
-            
-        is_valid, reason = is_nutrition_topic(title, content)
-        if not is_valid:
-            return None, reason
-            
-        return {"url": url, "title": title, "content": content}, "Thành công"
-    except Exception as e:
-        return None, f"Lỗi truy cập: {e}"
 
-# --- GIAO DIỆN STREAMLIT ---
-st.markdown("### 🎯 Nhập URL (Trang chủ / Chuyên mục / Bài viết)")
-urls_input = st.text_area("Dán các đường dẫn vào đây (Mỗi URL 1 dòng):", height=100, 
-                          placeholder="tamanhhospital.vn/mon-an-cho-nguoi-suy-nhuoc-co-the/\nhttps://viendinhduong.vn/")
-
-col1, col2 = st.columns(2)
-with col1:
-    deep_crawl = st.checkbox("🔍 Bật chế độ CÀO SÂU (Tự động tìm & cào tất cả bài viết bên trong trang gốc)", value=False)
-with col2:
-    max_sub_links = st.slider("Số bài viết con tối đa muốn quét cho mỗi trang:", min_value=5, max_value=100, value=20)
-
-if st.button("🚀 Bắt đầu Cào & Lọc Dữ Liệu", type="primary"):
-    raw_urls = [u.strip() for u in urls_input.split("\n") if u.strip()]
-    if not raw_urls:
-        st.warning("Vui lòng nhập ít nhất 1 URL!")
-    else:
-        results = []
-        if os.path.exists(OUTPUT_CLEAN_JSON):
-            try:
-                with open(OUTPUT_CLEAN_JSON, "r", encoding="utf-8") as f:
-                    results = json.load(f)
-            except: results = []
-            
-        existing_urls = {item["url"] for item in results if isinstance(item, dict) and "url" in item}
-        
-        target_urls = []
-        status_box = st.info("Đang thu thập danh sách liên kết...")
-        
-        for url in raw_urls:
-            url_formatted = fix_url_format(url)
-            if deep_crawl:
-                st.write(f"🔍 Đang tìm các bài viết bên trong: `{url_formatted}`...")
-                found_links = get_sub_links(url_formatted, max_links=max_sub_links)
-                st.write(f"   ↳ Tìm thấy **{len(found_links)}** liên kết tiềm năng.")
-                target_urls.extend(found_links)
-            target_urls.append(url_formatted)
-            
-        target_urls = list(set(target_urls))
-        status_box.empty()
-        
-        st.write(f"📋 **Tổng số {len(target_urls)} bài viết sẽ được kiểm tra và cào dữ liệu:**")
-        
-        progress_bar = st.progress(0)
-        log_container = st.container()
-        
-        added_count = 0
-        for idx, url in enumerate(target_urls):
-            if url in existing_urls:
-                with log_container:
-                    st.text(f"⏩ [{idx+1}/{len(target_urls)}] Đã có trong DB, bỏ qua: {url[:60]}...")
-                progress_bar.progress((idx + 1) / len(target_urls))
+def safe_request(url, timeout=20):
+    """Validate each redirect destination; do not automatically follow redirects."""
+    current = normalize_url(url)
+    with requests.Session() as session:
+        session.trust_env = False
+        for _ in range(5):
+            if not is_public_host(current): raise ValueError('Đích nội bộ/không công khai bị chặn')
+            response = session.get(current, headers=HEADERS, timeout=timeout, allow_redirects=False, stream=True)
+            if response.status_code in (301, 302, 303, 307, 308):
+                nxt = response.headers.get('Location')
+                response.close()
+                if not nxt: raise ValueError('Redirect thiếu Location')
+                current = normalize_url(urljoin(current, nxt))
                 continue
-                
-            data, status_msg = scrape_single_article(url)
-            
-            with log_container:
-                if data:
-                    results.append(data)
-                    existing_urls.add(url)
-                    added_count += 1
-                    st.success(f"✅ [{idx+1}/{len(target_urls)}] ACCEPT: {data['title'][:50]}... ({status_msg})")
+            response.raise_for_status()
+            size = 0
+            chunks = []
+            for chunk in response.iter_content(65536):
+                size += len(chunk)
+                if size > MAX_BYTES:
+                    response.close()
+                    raise ValueError('Tài liệu vượt giới hạn 12 MB')
+                chunks.append(chunk)
+            ctype = response.headers.get('Content-Type', '').lower()
+            encoding = response.encoding or 'utf-8'
+            response.close()
+            return current, b''.join(chunks), ctype, encoding
+    raise ValueError('Quá nhiều redirect')
+
+
+def robots_allowed(url, cache):
+    p = urlsplit(url)
+    origin = f'{p.scheme}://{p.netloc}'
+    if origin not in cache:
+        robots_url = origin + '/robots.txt'
+        try:
+            _, raw, _, enc = safe_request(robots_url, timeout=12)
+            rp = RobotFileParser()
+            rp.parse(raw.decode(enc, errors='replace').splitlines())
+            cache[origin] = rp
+        except Exception:
+            cache[origin] = None
+    rp = cache[origin]
+    return rp is not None and rp.can_fetch(USER_AGENT, url)
+
+
+def extract(url, raw, ctype, encoding):
+    if 'pdf' in ctype or urlsplit(url).path.lower().endswith('.pdf'):
+        with fitz.open(stream=raw, filetype='pdf') as pdf:
+            text = '\n\n'.join(page.get_text(sort=True) for page in pdf[:min(len(pdf), 150)])
+        title = urlsplit(url).path.rsplit('/', 1)[-1] or 'PDF'
+        return title, text.strip(), 'pdf', []
+    if 'html' not in ctype and not raw.lstrip().startswith((b'<!DOCTYPE', b'<html', b'<HTML')):
+        raise ValueError('Chỉ hỗ trợ HTML/PDF')
+    html = raw.decode(encoding, errors='replace')
+    soup = BeautifulSoup(html, 'html.parser')
+    title = (soup.h1.get_text(' ', strip=True) if soup.h1 else (soup.title.get_text(' ', strip=True) if soup.title else url))
+    links = [urljoin(url, a['href']) for a in soup.select('a[href]')]
+    text = trafilatura.extract(html, url=url, output_format='markdown', include_tables=True, include_links=False)
+    if not text:
+        for tag in soup(['script', 'style', 'nav', 'footer', 'header', 'aside']): tag.decompose()
+        text = (soup.find('main') or soup.find('article') or soup).get_text('\n', strip=True)
+    return title.strip(), (text or '').strip(), 'html', links
+
+
+def filter_reason(title, content, cfg):
+    if len(content) < int(cfg['min_chars']): return 'Nội dung quá ngắn'
+    text = (title + '\n' + content).casefold()
+    exclusions = [s.casefold().strip() for s in cfg['exclude'] if s.strip()]
+    if any(s in text for s in exclusions): return 'Khớp từ khóa loại trừ'
+    inclusions = [s.casefold().strip() for s in cfg['include'] if s.strip()]
+    if inclusions and not any(s in text for s in inclusions): return 'Không khớp từ khóa topic'
+    return ''
+
+
+def crawl(seeds, cfg, on_log):
+    queue = [(normalize_url(u), 0) for u in seeds]
+    allowed_hosts = {urlsplit(u).hostname for u, _ in queue}
+    visited = set()
+    robots = {}
+    accepted, rejected = 0, 0
+    con = db()
+    try:
+        while queue and len(visited) < cfg['max_pages']:
+            url, depth = queue.pop(0)
+            if url in visited: continue
+            visited.add(url)
+            if urlsplit(url).hostname not in allowed_hosts:
+                on_log(f'BỎ QUA (ngoài domain): {url}')
+                continue
+            if not robots_allowed(url, robots):
+                on_log(f'BỎ QUA (robots.txt không cho phép hoặc không kiểm tra được): {url}')
+                rejected += 1
+                continue
+            try:
+                final_url, raw, ctype, enc = safe_request(url)
+                if urlsplit(final_url).hostname not in allowed_hosts:
+                    raise ValueError('Redirect ra ngoài domain được chọn')
+                title, content, kind, links = extract(final_url, raw, ctype, enc)
+                reason = filter_reason(title, content, cfg)
+                if reason:
+                    rejected += 1
+                    on_log(f'LOẠI: {title[:60]} — {reason}')
                 else:
-                    st.caption(f"🛑 [{idx+1}/{len(target_urls)}] REJECT: {url[:50]}... -> {status_msg}")
-                    
-            progress_bar.progress((idx + 1) / len(target_urls))
-            time.sleep(0.3)
-            
-        with open(OUTPUT_CLEAN_JSON, "w", encoding="utf-8") as f:
-            json.dump(results, f, ensure_ascii=False, indent=2)
-            
-        st.balloons()
-        st.success(f"🎉 HOÀN THÀNH! Đã thêm thành công {added_count} bài viết đạt chuẩn vào file JSON.")
-        # ==============================================================================
-# 📥 NÚT TẢI FILE JSON TRỰC TIẾP VỀ MÁY CÁ NHÂN
-# ==============================================================================
-if os.path.exists(OUTPUT_CLEAN_JSON):
-    st.divider()
-    st.subheader("📥 Tải Dữ Liệu Đã Cào")
-    
-    with open(OUTPUT_CLEAN_JSON, "r", encoding="utf-8") as f:
-        json_data = f.read()
-        
-    st.download_button(
-        label="💾 Bấm vào đây để tải file dataset_dinh_duong_CUSTOM.json về máy",
-        data=json_data,
-        file_name="dataset_dinh_duong_CUSTOM.json",
-        mime="application/json",
-        type="primary"
-    )
+                    digest = hashlib.sha256(content.encode('utf-8')).hexdigest()
+                    con.execute('''INSERT INTO documents(url,title,content,sha256,content_type,fetched_at)
+                      VALUES(?,?,?,?,?,?) ON CONFLICT(url) DO UPDATE SET title=excluded.title,
+                      content=excluded.content,sha256=excluded.sha256,content_type=excluded.content_type,
+                      fetched_at=excluded.fetched_at''',
+                      (final_url, title, content, digest, kind, datetime.now(timezone.utc).isoformat()))
+                    doc_id = con.execute('SELECT id FROM documents WHERE url=?', (final_url,)).fetchone()['id']
+                    con.execute('INSERT OR IGNORE INTO memberships(topic_id,document_id,accepted) VALUES(?,?,0)', (cfg['topic_id'], doc_id))
+                    con.commit()
+                    accepted += 1
+                    on_log(f'ĐÃ LƯU: {title[:75]}')
+                if depth < cfg['max_depth']:
+                    for link in links:
+                        try:
+                            link = normalize_url(link)
+                            if urlsplit(link).hostname in allowed_hosts and link not in visited and not re.search(r'\.(jpg|jpeg|png|gif|zip|exe|css|js|svg)(\?|$)', link, re.I):
+                                if len(queue) < cfg['max_pages'] * 5: queue.append((link, depth + 1))
+                        except ValueError:
+                            pass
+            except Exception as exc:
+                rejected += 1
+                on_log(f'LỖI: {url[:90]} — {exc}')
+            time.sleep(cfg['delay'])
+    finally:
+        con.close()
+    return accepted, rejected, len(visited)
+
+
+def rows_for_topic(con, topic_id):
+    return con.execute('''SELECT d.*,m.accepted FROM documents d JOIN memberships m ON m.document_id=d.id
+                          WHERE m.topic_id=? ORDER BY d.fetched_at DESC''', (topic_id,)).fetchall()
+
+
+def export_zip(rows):
+    out = io.BytesIO()
+    manifest = []
+    with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as archive:
+        for row in rows:
+            slug = re.sub(r'[^a-zA-Z0-9_-]+', '-', row['title'])[:50].strip('-') or 'document'
+            filename = f"{row['id']:05d}-{slug}.md"
+            body = f"# {row['title']}\n\nSource: {row['url']}\nFetched: {row['fetched_at']}\n\n{row['content']}\n"
+            archive.writestr('documents/' + filename, body)
+            manifest.append({'file': filename, 'url': row['url'], 'title': row['title'], 'sha256': row['sha256']})
+        archive.writestr('manifest.json', json.dumps(manifest, ensure_ascii=False, indent=2))
+    return out.getvalue()
+
+st.set_page_config(page_title='Universal Knowledge Crawler', page_icon='📚', layout='wide')
+st.title('📚 Universal Knowledge Crawler')
+st.caption('Crawl đa lĩnh vực · Lưu trữ local · Duyệt tài liệu · Xuất Markdown cho RAG')
+con = db()
+tab_topic, tab_crawl, tab_library, tab_sync = st.tabs(['🗂️ Topics', '🌐 Crawl', '📖 Library', '🔗 OpenWebUI'])
+
+with tab_topic:
+    st.subheader('Tạo topic mới')
+    name = st.text_input('Tên topic', placeholder='Network Security / Accounting / Machine Learning / General')
+    a, b = st.columns(2)
+    with a:
+        include = st.text_area('Từ khóa liên quan (mỗi dòng một từ, để trống = không lọc)')
+    with b:
+        exclude = st.text_area('Từ khóa loại trừ (mỗi dòng một từ)')
+    if st.button('Tạo topic', type='primary'):
+        if not name.strip(): st.error('Nhập tên topic')
+        else:
+            try:
+                con.execute('INSERT INTO topics(name,config) VALUES(?,?)', (name.strip(), json.dumps({'include': include.splitlines(), 'exclude': exclude.splitlines()}, ensure_ascii=False)))
+                con.commit()
+                st.success('Đã tạo topic')
+            except sqlite3.IntegrityError: st.warning('Topic đã tồn tại')
+    topics = con.execute('SELECT * FROM topics ORDER BY name').fetchall()
+    if topics: st.dataframe(pd.DataFrame([{'ID': t['id'], 'Topic': t['name'], 'Keywords': ', '.join(json.loads(t['config']).get('include', []))} for t in topics]), hide_index=True)
+
+with tab_crawl:
+    topics = con.execute('SELECT * FROM topics ORDER BY name').fetchall()
+    if not topics:
+        st.info('Tạo topic ở tab Topics trước. Có thể đặt tên General và không nhập từ khóa.')
+    else:
+        options = {f"{t['name']} (#{t['id']})": t for t in topics}
+        selected = options[st.selectbox('Topic đích', list(options))]
+        cfg_saved = json.loads(selected['config'])
+        urls = st.text_area('Seed URLs (mỗi dòng một URL)', placeholder='https://learn.microsoft.com/...\nhttps://csrc.nist.gov/...', height=110)
+        c1, c2, c3 = st.columns(3)
+        with c1: max_depth = st.slider('Độ sâu link', 0, 3, 1)
+        with c2: max_pages = st.number_input('Tối đa trang / lần', 1, 200, 20)
+        with c3: delay = st.number_input('Chờ giữa các trang (giây)', 1.0, 30.0, 2.0, 0.5)
+        min_chars = st.number_input('Số ký tự tối thiểu', 100, 10000, 250, 50)
+        st.caption('Chỉ theo domain seed URL; robots.txt không đọc được sẽ bỏ qua. Không truy cập host/IP nội bộ. Chỉ crawl nguồn được phép.')
+        if st.button('🚀 Bắt đầu crawl', type='primary'):
+            seeds = [x.strip() for x in urls.splitlines() if x.strip()]
+            if not seeds: st.error('Nhập ít nhất một URL')
+            else:
+                cfg = dict(cfg_saved, topic_id=selected['id'], max_depth=max_depth, max_pages=int(max_pages), delay=float(delay), min_chars=int(min_chars))
+                logs = []
+                placeholder = st.empty()
+                def log(message):
+                    logs.append(message)
+                    placeholder.code('\n'.join(logs[-20:]), language='text')
+                try:
+                    ok, bad, count = crawl(seeds, cfg, log)
+                    st.success(f'Đã duyệt {count} URL · Lưu {ok} · Bỏ qua/lỗi {bad}')
+                except Exception as exc: st.error(str(exc))
+
+with tab_library:
+    topics = con.execute('SELECT * FROM topics ORDER BY name').fetchall()
+    if not topics: st.info('Chưa có topic')
+    else:
+        selected = st.selectbox('Xem topic', topics, format_func=lambda x:x['name'], key='library_topic')
+        rows = rows_for_topic(con, selected['id'])
+        st.metric('Tài liệu', len(rows))
+        if rows:
+            st.dataframe(pd.DataFrame([{'ID': r['id'], 'Title': r['title'], 'Source': r['url'], 'Approved': bool(r['accepted']), 'Fetched': r['fetched_at']} for r in rows]), hide_index=True)
+            chosen = st.selectbox('Xem và duyệt tài liệu', rows, format_func=lambda r:f"#{r['id']} · {r['title']}")
+            st.markdown(f"**Nguồn:** {chosen['url']}")
+            st.text_area('Nội dung trích xuất', chosen['content'], height=270)
+            approved = st.checkbox('Duyệt tài liệu này để xuất KB', value=bool(chosen['accepted']), key=f"approve_{chosen['id']}_{selected['id']}")
+            if st.button('Lưu trạng thái duyệt'):
+                con.execute('UPDATE memberships SET accepted=? WHERE topic_id=? AND document_id=?', (int(approved), selected['id'], chosen['id']))
+                con.commit()
+                st.success('Đã lưu')
+            approved_rows = [r for r in rows if r['accepted']]
+            st.download_button('📦 Tải ZIP Markdown + manifest (đã duyệt)', export_zip(approved_rows), file_name=f"topic-{selected['id']}-knowledge.zip", mime='application/zip', disabled=not approved_rows)
+            st.download_button('📋 Tải JSON (đã duyệt)', json.dumps([dict(r) for r in approved_rows], ensure_ascii=False, indent=2), file_name=f"topic-{selected['id']}-knowledge.json", mime='application/json', disabled=not approved_rows)
+
+with tab_sync:
+    st.subheader('OpenWebUI connector')
+    st.info('V1: xuất Markdown/JSON đã kiểm duyệt. V2: kết nối API OpenWebUI để upload và gắn KB; chưa tự động đồng bộ ở phiên bản này.')
+    st.markdown('1. Vào **Library** → duyệt tài liệu.\n2. Tải ZIP Markdown.\n3. Giải nén, vào **OpenWebUI → Workspace → Knowledge** để upload các file Markdown.')
+    st.warning('Không nhập Admin API key vào source code hoặc file JSON xuất ra. Cloudflare Access có thể yêu cầu Service Token riêng.')
+con.close()
