@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parent
 DATA = ROOT / 'data'
 DATA.mkdir(exist_ok=True)
 DB = DATA / 'crawler.sqlite3'
-USER_AGENT = 'UniversalKnowledgeCrawler/1.0 (respectful research crawler)'
+USER_AGENT = 'UniversalKnowledgeCrawler/1.0 (contact: configure-your-contact)'
 HEADERS = {'User-Agent': USER_AGENT, 'Accept': 'text/html,application/pdf;q=0.9,*/*;q=0.5'}
 MAX_BYTES = 12 * 1024 * 1024
 
@@ -114,7 +114,7 @@ def robots_allowed(url, cache):
 def extract(url, raw, ctype, encoding):
     if 'pdf' in ctype or urlsplit(url).path.lower().endswith('.pdf'):
         with fitz.open(stream=raw, filetype='pdf') as pdf:
-            text = '\n\n'.join(page.get_text(sort=True) for page in pdf[:min(len(pdf), 150)])
+            text = '\n\n'.join(page.get_text(sort=True) for page in (pdf[i] for i in range(min(len(pdf), 150))))
         title = urlsplit(url).path.rsplit('/', 1)[-1] or 'PDF'
         return title, text.strip(), 'pdf', []
     if 'html' not in ctype and not raw.lstrip().startswith((b'<!DOCTYPE', b'<html', b'<HTML')):
@@ -198,8 +198,8 @@ def crawl(seeds, cfg, on_log):
 
 
 def rows_for_topic(con, topic_id):
-    return con.execute('''SELECT d.*,m.accepted FROM documents d JOIN memberships m ON m.document_id=d.id
-                          WHERE m.topic_id=? ORDER BY d.fetched_at DESC''', (topic_id,)).fetchall()
+    return [dict(r) for r in con.execute('''SELECT d.*,m.accepted FROM documents d JOIN memberships m ON m.document_id=d.id
+                          WHERE m.topic_id=? ORDER BY d.fetched_at DESC''', (topic_id,)).fetchall()]
 
 
 def export_zip(rows):
@@ -237,11 +237,11 @@ with tab_topic:
                 con.commit()
                 st.success('Đã tạo topic')
             except sqlite3.IntegrityError: st.warning('Topic đã tồn tại')
-    topics = con.execute('SELECT * FROM topics ORDER BY name').fetchall()
+    topics = [dict(t) for t in con.execute('SELECT * FROM topics ORDER BY name').fetchall()]
     if topics: st.dataframe(pd.DataFrame([{'ID': t['id'], 'Topic': t['name'], 'Keywords': ', '.join(json.loads(t['config']).get('include', []))} for t in topics]), hide_index=True)
 
 with tab_crawl:
-    topics = con.execute('SELECT * FROM topics ORDER BY name').fetchall()
+    topics = [dict(t) for t in con.execute('SELECT * FROM topics ORDER BY name').fetchall()]
     if not topics:
         st.info('Tạo topic ở tab Topics trước. Có thể đặt tên General và không nhập từ khóa.')
     else:
@@ -271,22 +271,27 @@ with tab_crawl:
                 except Exception as exc: st.error(str(exc))
 
 with tab_library:
-    topics = con.execute('SELECT * FROM topics ORDER BY name').fetchall()
+    topics = [dict(t) for t in con.execute('SELECT * FROM topics ORDER BY name').fetchall()]
     if not topics: st.info('Chưa có topic')
     else:
-        selected = st.selectbox('Xem topic', topics, format_func=lambda x:x['name'], key='library_topic')
+        topic_by_id = {str(t['id']): t for t in topics}
+        selected_topic_id = st.selectbox('Xem topic', list(topic_by_id), format_func=lambda k: topic_by_id[k]['name'], key='library_topic')
+        selected = topic_by_id[selected_topic_id]
         rows = rows_for_topic(con, selected['id'])
         st.metric('Tài liệu', len(rows))
         if rows:
             st.dataframe(pd.DataFrame([{'ID': r['id'], 'Title': r['title'], 'Source': r['url'], 'Approved': bool(r['accepted']), 'Fetched': r['fetched_at']} for r in rows]), hide_index=True)
-            chosen = st.selectbox('Xem và duyệt tài liệu', rows, format_func=lambda r:f"#{r['id']} · {r['title']}")
+            document_by_id = {str(r['id']): r for r in rows}
+            selected_document_id = st.selectbox('Xem và duyệt tài liệu', list(document_by_id), format_func=lambda k: f"#{k} · {document_by_id[k]['title']}")
+            chosen = document_by_id[selected_document_id]
             st.markdown(f"**Nguồn:** {chosen['url']}")
-            st.text_area('Nội dung trích xuất', chosen['content'], height=270)
+            st.text_area('Nội dung trích xuất', chosen['content'], height=270, key=f"preview_{chosen['id']}")
             approved = st.checkbox('Duyệt tài liệu này để xuất KB', value=bool(chosen['accepted']), key=f"approve_{chosen['id']}_{selected['id']}")
             if st.button('Lưu trạng thái duyệt'):
                 con.execute('UPDATE memberships SET accepted=? WHERE topic_id=? AND document_id=?', (int(approved), selected['id'], chosen['id']))
                 con.commit()
                 st.success('Đã lưu')
+                st.rerun()
             approved_rows = [r for r in rows if r['accepted']]
             st.download_button('📦 Tải ZIP Markdown + manifest (đã duyệt)', export_zip(approved_rows), file_name=f"topic-{selected['id']}-knowledge.zip", mime='application/zip', disabled=not approved_rows)
             st.download_button('📋 Tải JSON (đã duyệt)', json.dumps([dict(r) for r in approved_rows], ensure_ascii=False, indent=2), file_name=f"topic-{selected['id']}-knowledge.json", mime='application/json', disabled=not approved_rows)
